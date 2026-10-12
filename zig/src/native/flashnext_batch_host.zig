@@ -42,16 +42,25 @@ fn learnedStates(gpa: std.mem.Allocator, eng: *fx.Engine, root: []const u8, cap:
 
 /// macOS unwires GPU memory after 1-2 s idle and the next request re-wires it all (2 s before its first token): the
 /// engine's buffers, every session's and the tower's join one residency set the idle keepalive uses.
-fn holdResident(h: *Host) !void {
+/// Only while the set, the prompt cache's `cache` bytes and a margin fit the GPU's recommended working set: a set past it
+/// slowed the GPU-side rounds about threefold on a 256 GB M5 Ultra (#606: 195.8 GiB held), one under it holds them at speed.
+fn holdResident(h: *Host, cache: u64) !void {
     var list: std.ArrayList(mtl.Buffer) = .empty;
     defer list.deinit(h.gpa);
     try list.appendSlice(h.gpa, h.eng.r.held.items);
     for (h.back.sessions) |s| try list.appendSlice(h.gpa, s.owned.items);
     try list.append(h.gpa, h.back.hidden.b);
     if (h.vision) |v| try list.appendSlice(h.gpa, &v.tower.buffers());
+    var bytes: u64 = 0;
+    for (list.items) |b| bytes += b.length();
+    const room = h.eng.r.device.maxWorkingSet();
+    if (bytes +| cache +| fit.MARGIN > room) {
+        std.log.warn("flash next: no residency set: its {d:.1} GiB and the prompt cache's {d:.1} GiB pass the GPU's {d:.1} GiB working set; the first request after an idle second waits for the model's memory", .{ fit.gibs(bytes), fit.gibs(cache), fit.gibs(room) });
+        return;
+    }
     h.resident = try Resident.initTicked(h.eng.r.device, h.eng.r.queue, list.items, true);
     h.warm = (&h.resident.?).target();
-    std.log.info("flash next: {d} buffers ({d:.1} GiB) held resident between requests", .{ list.items.len, fit.gibs(h.resident.?.set.allocatedSize()) });
+    std.log.info("flash next: {d} buffers ({d:.1} GiB) held resident between requests, under the GPU's {d:.1} GiB working set", .{ list.items.len, fit.gibs(h.resident.?.set.allocatedSize()), fit.gibs(room) });
 }
 
 /// What the sessions may take the server to: 70% of RAM, or FLASHNEXT_LOAD_LIMIT_GB (GB, as GLM_LOAD_LIMIT_GB) up to the
@@ -175,7 +184,7 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, dir: []const u8, dump: ?[]const 
     h.host.explain = .{ .text = words };
     h.warm = .{ .queue = eng.r.queue };
     h.resident = null;
-    if (std.c.getenv("FLASHNEXT_NO_RESIDENCY") == null) holdResident(h) catch |err| std.log.warn("flash next: no residency set ({s}): the first request after an idle second re-wires the model", .{@errorName(err)});
+    if (std.c.getenv("FLASHNEXT_NO_RESIDENCY") == null) holdResident(h, plan.budget_bytes) catch |err| std.log.warn("flash next: no residency set ({s}): the first request after an idle second re-wires the model", .{@errorName(err)});
     errdefer if (h.resident) |*r| r.deinit();
     h.host.keepalive_target = .{ .ctx = &h.warm, .tick = mtl.keepalive.Target.tick };
     try h.host.start();
