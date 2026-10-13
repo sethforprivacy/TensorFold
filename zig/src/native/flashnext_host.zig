@@ -485,7 +485,7 @@ pub fn open(gpa: Allocator, io: std.Io, dir: []const u8, dump: ?[]const u8, wind
     h.vision = vis;
     if (vis) |v| h.info_.vision = v.offer();
     // macOS unwires GPU memory after 1-2 s idle and the next request re-wires it all: one set the idle keepalive uses
-    if (std.c.getenv("FLASHNEXT_NO_RESIDENCY") == null) holdResident(h, budget) catch |err| std.log.warn("flash next: no residency set ({s}): the first request after an idle second re-wires the model", .{@errorName(err)});
+    if (std.c.getenv("FLASHNEXT_NO_RESIDENCY") == null) holdResident(h) catch |err| std.log.warn("flash next: no residency set ({s}): the first request after an idle second re-wires the model", .{@errorName(err)});
     errdefer if (h.resident) |*r| r.deinit();
     if (!eng.followsPeer() and budget > 0) h.cache = pc.Store.init(gpa, .{ .ptr = h, .vtable = &.{ .bytes = Snaps.bytes, .save = Snaps.save, .restore = Snaps.restore, .drop = Snaps.drop, .charged = Snaps.charged, .spare = Snaps.spare, .trim = Snaps.trim, .reuses = Snaps.reuses, .write = Snaps.write, .read = Snaps.read, .forget = Snaps.forget } }, .{ .lookahead = 1 }, budget);
     h.info_.prompt_cache = h.cache != null;
@@ -499,20 +499,11 @@ pub fn open(gpa: Allocator, io: std.Io, dir: []const u8, dump: ?[]const u8, wind
 }
 
 /// The engine's buffers and the tower's in one residency set; the idle keepalive's ticks use it.
-/// Only while the set, the prompt cache's `cache` bytes and a margin fit the GPU's recommended working set: a set past it
-/// slowed the GPU-side rounds about threefold on a 256 GB M5 Ultra (#606: 195.8 GiB held), one under it holds them at speed.
-fn holdResident(h: *Host, cache: u64) !void {
+fn holdResident(h: *Host) !void {
     var list: std.ArrayList(mtl.Buffer) = .empty;
     defer list.deinit(h.gpa);
     try list.appendSlice(h.gpa, h.eng.r.held.items);
     if (h.vision) |v| try list.appendSlice(h.gpa, &v.tower.buffers());
-    var bytes: u64 = 0;
-    for (list.items) |b| bytes += b.length();
-    const room = h.eng.r.device.maxWorkingSet();
-    if (bytes +| cache +| cache_fit.MARGIN > room) {
-        std.log.warn("flash next: no residency set: its {d:.1} GiB and the prompt cache's {d:.1} GiB pass the GPU's {d:.1} GiB working set; the first request after an idle second waits for the model's memory", .{ cache_fit.gibs(bytes), cache_fit.gibs(cache), cache_fit.gibs(room) });
-        return;
-    }
     h.resident = try Resident.initTicked(h.eng.r.device, h.eng.r.queue, list.items, true);
     h.warm = (&h.resident.?).target();
 }
