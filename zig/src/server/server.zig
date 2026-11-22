@@ -354,20 +354,23 @@ pub const Server = struct {
         const required = if (f.get("tool_call_required")) |r| r.truthy() else false;
         const one_call = if (f.get("tool_call_single")) |x| x.truthy() else false;
         const all = has_tools and !required and (tool_grammar.autoAllEnv() catch return cx.fail(.server, "invalid TF_DSV41_TOOL_GRAMMAR: expected 0 or 1", .{}));
-        if (has_tools and required) {
+        // Lane-local: Inkling 2 writes a call as a typed block, which the tool grammar cannot frame, so a required call
+        // is left to the model as "auto" is, and so is json_object, as the lane's previous engine left them.
+        const typed = srv.text.vtable.format == .inkling;
+        if (has_tools and required and !typed) {
             if (!srv.info.capability(.structures)) return cx.fail(.request, "backend '{s}' cannot enforce tool_choice \"required\" or a named function: it has no token grammar support; send \"auto\" or \"none\"", .{srv.backendName()});
             request.structure = try tool_grammar.structure(srv, cx, tools, !one_call, thinking);
-        } else if (has_tools and srv.info.capability(.structures) and tool_grammar.autoWanted(tools, all) and srv.grammarCompiler() != null) {
+        } else if (has_tools and !typed and srv.info.capability(.structures) and tool_grammar.autoWanted(tools, all) and srv.grammarCompiler() != null) {
             // auto with a strict tool (any, TENSORFOLD_TOOL_GRAMMAR=1): text or calls; no grammar library, no grammar
             request.structure = try tool_grammar.optionalStructure(srv, cx, tools, all, !one_call, thinking);
         }
-        if (try grammar.spec(cx, f)) |s| {
+        if (try grammar.spec(cx, f)) |s| if (!(typed and s.kind == .json)) {
             if (!srv.info.capability(.structures)) return cx.refuse("structured output (response_format and the guided_* fields) is not supported by this engine yet");
             if (s.text.len > grammar.max_text) return cx.fail(.request, "{s}: the grammar is {d} bytes, more than the {d} KiB a grammar may be", .{ s.field, s.text.len, grammar.max_text / 1024 });
             const st = try srv.compiledStructure(cx, s.kind, s.text, s.field, thinking);
             if (request.structure) |tool| tool.free();
             request.structure = st;
-        }
+        };
         try budgetStructure(cx, f, request);
     }
 
