@@ -21,7 +21,7 @@ pub const Kernels = struct {
     pub fn init(a: std.mem.Allocator, device: mtl.Device) !Kernels {
         var scalar_lib = try mtl.Library.fromSource(device, src.attention, mtl.CompileOptions.mlx());
         errdefer scalar_lib.deinit();
-        const units = device.tensorUnits();
+        const units = device.tensorUnits() and std.c.getenv("TF_CMP_NO_ATTN_UNITS") == null;
         const prompt_src = try a.dupe(u8, if (units) src.prompt_attention else src.prompt_attention_pre_m5);
         defer a.free(prompt_src);
         var prompt_lib = try mtl.Library.fromSource(device, prompt_src, mtl.CompileOptions.mlx());
