@@ -7,6 +7,26 @@ const ap = @import("attention_plan.zig");
 const attention = @import("attention.zig");
 const glue = @import("glue.zig");
 const experts = @import("experts.zig");
+
+/// Comparison switches: each tensor-unit path can be turned off, here or by a letter in TF_CMP_OFF (e, l, d, a).
+pub var cmp_experts_units: bool = true;
+pub var cmp_logits_units: bool = true;
+pub var cmp_prompt_dense: bool = true;
+pub var cmp_prompt_attn: bool = true;
+var cmp_read: bool = false;
+fn cmpOn(flag: *const bool) bool {
+    if (!cmp_read) {
+        cmp_read = true;
+        if (std.c.getenv("TF_CMP_OFF")) |off| for (std.mem.span(off)) |c| switch (c) {
+            'e' => cmp_experts_units = false,
+            'l' => cmp_logits_units = false,
+            'd' => cmp_prompt_dense = false,
+            'a' => cmp_prompt_attn = false,
+            else => {},
+        };
+    }
+    return flag.*;
+}
 const loop = @import("loop.zig");
 const state = @import("state.zig");
 const model_file = @import("model.zig");
@@ -115,7 +135,7 @@ pub fn dense(m: *const Model, e: mtl.ComputeEncoder, weight: ck.Tensor, input: R
 /// A visit's projection: a prompt's rows on the tensor units, a round's rows as `dense`.
 fn project(m: *const Model, e: mtl.ComputeEncoder, prompt: bool, weight: ck.Tensor, input: Ref, out: Ref, rows: usize) !void {
     const k = weight.shape[weight.rank - 1];
-    if (!prompt or m.experts.units == null or (k != 2304 and k != 3072)) return dense(m, e, weight, input, out, rows);
+    if (!prompt or !cmpOn(&cmp_prompt_dense) or m.experts.units == null or (k != 2304 and k != 3072)) return dense(m, e, weight, input, out, rows);
     try experts.denseUnits(&m.experts, e, x(input), x(.{ .buf = weight.buffer, .off = weight.offset }), x(out), @intCast(rows), @intCast(weight.shape[weight.rank - 2]), @intCast(k));
 }
 
@@ -221,8 +241,8 @@ fn attendSegments(m: *const Model, e: mtl.ComputeEncoder, s: *state.Scratch, v: 
             .base = base,
             .rows = seg.rows,
             // A prompt's rows on a sliding layer: the prompt kernel, a tile of keys a chunk.
-            .rr = .{ .rows = @intCast(seg.rows), .heads = 24, .kv_heads = 8, .last_pos = @intCast(cache.len + seg.rows - 1), .streams = 1, .prompt = prompt and m.attention.units and layer0.window > 0 },
-            .layer = .{ .window = layer0.window, .ring = @intCast(cache.ring(v.cache_slot)), .chunk = if (prompt and m.attention.units and layer0.window > 0) ap.tile_keys else layer0.chunk, .tau = layer0.tau },
+            .rr = .{ .rows = @intCast(seg.rows), .heads = 24, .kv_heads = 8, .last_pos = @intCast(cache.len + seg.rows - 1), .streams = 1, .prompt = prompt and cmpOn(&cmp_prompt_attn) and m.attention.units and layer0.window > 0 },
+            .layer = .{ .window = layer0.window, .ring = @intCast(cache.ring(v.cache_slot)), .chunk = if (prompt and cmpOn(&cmp_prompt_attn) and m.attention.units and layer0.window > 0) ap.tile_keys else layer0.chunk, .tau = layer0.tau },
             .meta = .{ .pos = a(at(s.pos, base * 4)), .seg_of = a(at(s.seg_of, base * 4)), .segs = a(at(s.segs, si * @sizeOf(ap.Seg))) },
             .kv = .{ .k = a(cache.keys(v.cache_slot)), .v = a(cache.values(v.cache_slot)) },
         };
@@ -291,7 +311,7 @@ fn routedExperts(m: *const Model, e: mtl.ComputeEncoder, s: *state.Scratch, laye
     };
     const gu_call = experts.Call{ .rows = @intCast(rows), .k = state.hidden, .n = state.intermediate, .format = precision };
     const down_call = experts.Call{ .rows = @intCast(rows), .k = state.intermediate, .n = state.hidden, .format = precision };
-    if (m.experts.units != null) {
+    if (cmpOn(&cmp_experts_units) and m.experts.units != null) {
         // On the tensor units a row's sums are the same at every width, so every chunk and window takes this path.
         try experts.group(&m.experts, e, x(at(s.route_ids, 0)), gu_call);
         e.barrier();
@@ -461,7 +481,7 @@ pub fn runShared(m: *const Model, s: *state.Scratch, segments: []const Segment, 
     e.barrier();
     if (options.taps) |to| captureTap(m, e, at(s.mlp_normed, 0), to, final.capture_rows, 3);
     const logits = if (options.all) at(s.logits_all, 0) else at(segments[0].cache.logits, 0);
-    if (m.experts.units != null) try experts.logitsUnits(&m.experts, e, x(at(s.mlp_normed, final.logits_row * state.hidden * 2)), x(r(m.weights.unembed)), x(logits), @intCast(final.logits_rows), m.config.text.unpadded_vocab) else glue.logits(&m.glue, e, at(s.mlp_normed, final.logits_row * state.hidden * 2), r(m.weights.unembed), logits, @intCast(final.logits_rows), m.config.text.unpadded_vocab);
+    if (cmpOn(&cmp_logits_units) and m.experts.units != null) try experts.logitsUnits(&m.experts, e, x(at(s.mlp_normed, final.logits_row * state.hidden * 2)), x(r(m.weights.unembed)), x(logits), @intCast(final.logits_rows), m.config.text.unpadded_vocab) else glue.logits(&m.glue, e, at(s.mlp_normed, final.logits_row * state.hidden * 2), r(m.weights.unembed), logits, @intCast(final.logits_rows), m.config.text.unpadded_vocab);
     commitFullHistories(m, e, s, segments);
     e.end();
     cb.commit();

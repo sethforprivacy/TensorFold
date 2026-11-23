@@ -1,5 +1,6 @@
 //! Host-only Inkling 2 Mini Metal launch plans and scalar arithmetic references.
 const serving = if (@import("builtin").os.tag.isDarwin()) @import("serving_test.zig") else struct {};
+const units_compare = if (@import("builtin").os.tag.isDarwin()) @import("units_compare_test.zig") else struct {};
 
 test {
     _ = @import("attention_test.zig");
@@ -15,4 +16,5 @@ test {
     _ = @import("dspark.zig");
     _ = @import("backend.zig");
     _ = serving;
+    _ = units_compare;
 }
